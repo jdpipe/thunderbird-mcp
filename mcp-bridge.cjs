@@ -14,9 +14,41 @@ const os = require('os');
 
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
-const CONNECTION_FILE = path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json');
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
+const DEBUG_ENABLED =
+  process.stdin.isTTY ||
+  process.env.THUNDERBIRD_MCP_DEBUG === '1' ||
+  process.env.THUNDERBIRD_MCP_DEBUG === 'true';
+
+function getConnectionFileCandidates() {
+  const candidates = [];
+  const seen = new Set();
+
+  function addCandidate(candidate) {
+    if (!candidate) return;
+    const resolved = path.resolve(candidate);
+    if (seen.has(resolved)) return;
+    seen.add(resolved);
+    candidates.push(resolved);
+  }
+
+  addCandidate(process.env.THUNDERBIRD_MCP_CONNECTION_FILE);
+  addCandidate(path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json'));
+  addCandidate(path.join(os.homedir(), 'Downloads', 'thunderbird.tmp', 'thunderbird-mcp', 'connection.json'));
+  addCandidate(path.join(os.homedir(), 'snap', 'thunderbird', 'common', 'thunderbird.tmp', 'thunderbird-mcp', 'connection.json'));
+
+  return candidates;
+}
+
+const CONNECTION_FILE_CANDIDATES = getConnectionFileCandidates();
+
+function logStatus(message, details) {
+  if (!DEBUG_ENABLED) return;
+  const prefix = `[thunderbird-mcp ${new Date().toISOString()} pid=${process.pid}]`;
+  const suffix = details ? ` ${JSON.stringify(details)}` : '';
+  process.stderr.write(`${prefix} ${message}${suffix}\n`);
+}
 
 /**
  * Read connection info (port + auth token) written by the Thunderbird extension.
@@ -30,21 +62,37 @@ const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
 
 function readConnectionInfo() {
   if (cachedConnectionInfo && Date.now() < connectionCacheExpiry) {
+    logStatus('Using cached connection info', {
+      port: cachedConnectionInfo.port,
+      source: cachedConnectionInfo.__sourcePath
+    });
     return cachedConnectionInfo;
   }
-  try {
-    const data = JSON.parse(fs.readFileSync(CONNECTION_FILE, 'utf8'));
-    cachedConnectionInfo = data;
-    connectionCacheExpiry = Date.now() + CONNECTION_CACHE_TTL_MS;
-    return data;
-  } catch {
-    return null;
+
+  for (const connectionFile of CONNECTION_FILE_CANDIDATES) {
+    try {
+      const data = JSON.parse(fs.readFileSync(connectionFile, 'utf8'));
+      const result = { ...data, __sourcePath: connectionFile };
+      cachedConnectionInfo = result;
+      connectionCacheExpiry = Date.now() + CONNECTION_CACHE_TTL_MS;
+      logStatus('Loaded connection info', {
+        path: connectionFile,
+        port: data.port,
+        hasToken: Boolean(data.token)
+      });
+      return result;
+    } catch {
+      logStatus('Connection file unavailable', { path: connectionFile });
+    }
   }
+
+  return null;
 }
 
 function clearConnectionCache() {
   cachedConnectionInfo = null;
   connectionCacheExpiry = 0;
+  logStatus('Cleared cached connection info');
 }
 
 // Ensure stdout doesn't buffer - critical for MCP protocol
@@ -89,6 +137,7 @@ function sanitizeJson(data) {
 }
 
 async function handleMessage(line) {
+  logStatus('Received stdin line');
   const message = JSON.parse(line);
   const hasId = Object.prototype.hasOwnProperty.call(message, 'id');
   const isNotification =
@@ -103,6 +152,7 @@ async function handleMessage(line) {
   // handshake even when Thunderbird isn't running yet.
   switch (message.method) {
     case 'initialize':
+      logStatus('Handling initialize locally', { id: message.id });
       return {
         jsonrpc: '2.0',
         id: message.id,
@@ -113,13 +163,17 @@ async function handleMessage(line) {
         }
       };
     case 'ping':
+      logStatus('Handling ping locally', { id: message.id });
       return { jsonrpc: '2.0', id: message.id, result: {} };
     case 'resources/list':
+      logStatus('Handling resources/list locally', { id: message.id });
       return { jsonrpc: '2.0', id: message.id, result: { resources: [] } };
     case 'prompts/list':
+      logStatus('Handling prompts/list locally', { id: message.id });
       return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
   }
 
+  logStatus('Forwarding request to Thunderbird', { id: message.id, method: message.method });
   return forwardToThunderbird(message);
 }
 
@@ -139,6 +193,7 @@ function tryRequest(hostname, postData, port, token) {
       method: 'POST',
       headers
     }, (res) => {
+      logStatus('Thunderbird responded', { hostname, port, statusCode: res.statusCode });
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
@@ -160,13 +215,18 @@ function tryRequest(hostname, postData, port, token) {
       });
     });
 
-    req.on('error', reject);
+    req.on('error', (err) => {
+      logStatus('HTTP request failed', { hostname, port, code: err.code, message: err.message });
+      reject(err);
+    });
 
     req.setTimeout(REQUEST_TIMEOUT, () => {
       req.destroy();
+      logStatus('HTTP request timed out', { hostname, port, timeoutMs: REQUEST_TIMEOUT });
       reject(new Error('Request to Thunderbird timed out'));
     });
 
+    logStatus('Sending HTTP request to Thunderbird', { hostname, port });
     req.write(postData);
     req.end();
   });
@@ -181,10 +241,16 @@ async function forwardToThunderbird(message, _retried) {
   // Never forward requests without authentication.
   let connInfo = readConnectionInfo();
   if (!connInfo) {
+    logStatus('Waiting for connection file', {
+      paths: CONNECTION_FILE_CANDIDATES,
+      retries: CONNECTION_MAX_RETRIES,
+      retryDelayMs: CONNECTION_RETRY_DELAY_MS
+    });
     for (let attempt = 0; attempt < CONNECTION_MAX_RETRIES; attempt++) {
       await new Promise(r => setTimeout(r, CONNECTION_RETRY_DELAY_MS));
       connInfo = readConnectionInfo();
       if (connInfo) break;
+      logStatus('Connection file still missing', { attempt: attempt + 1 });
     }
     if (!connInfo) {
       throw new Error(
@@ -199,6 +265,12 @@ async function forwardToThunderbird(message, _retried) {
   }
 
   const { port, token } = connInfo;
+  logStatus('Using Thunderbird connection info', {
+    port,
+    hasToken: Boolean(token),
+    retried: Boolean(_retried),
+    source: connInfo.__sourcePath
+  });
 
   // Try each host in order - handles platforms where 'localhost' resolves to
   // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1).
@@ -233,9 +305,35 @@ async function forwardToThunderbird(message, _retried) {
 
 // Process stdin as JSON-RPC messages
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
+let sawInput = false;
+let idleTimer = null;
+
+logStatus('Bridge started', {
+  node: process.version,
+  interactiveStdin: Boolean(process.stdin.isTTY),
+  connectionFiles: CONNECTION_FILE_CANDIDATES
+});
+
+if (process.stdin.isTTY) {
+  logStatus('Interactive launch detected; the bridge waits for JSON-RPC on stdin');
+  logStatus('Example', {
+    command: `echo '${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}' | node ${path.basename(__filename)}`
+  });
+}
+
+idleTimer = setTimeout(() => {
+  if (!sawInput) {
+    logStatus('Still waiting for stdin input');
+  }
+}, 1500);
 
 rl.on('line', (line) => {
   if (!line.trim()) return;
+  sawInput = true;
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
 
   let messageId = null;
   try {
@@ -266,8 +364,19 @@ rl.on('line', (line) => {
 
 rl.on('close', () => {
   stdinClosed = true;
+  if (!sawInput) {
+    logStatus('stdin closed without receiving any messages');
+  } else {
+    logStatus('stdin closed', { pendingRequests });
+  }
   checkExit();
 });
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => {
+  logStatus('Received SIGINT, exiting');
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  logStatus('Received SIGTERM, exiting');
+  process.exit(0);
+});
