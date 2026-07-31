@@ -35,6 +35,7 @@ function getConnectionFileCandidates() {
 
   addCandidate(process.env.THUNDERBIRD_MCP_CONNECTION_FILE);
   addCandidate(path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json'));
+  addCandidate(path.join(os.homedir(), 'snap', 'thunderbird', 'common', 'tmp', 'thunderbird-mcp', 'connection.json'));
   addCandidate(path.join(os.homedir(), 'Downloads', 'thunderbird.tmp', 'thunderbird-mcp', 'connection.json'));
   addCandidate(path.join(os.homedir(), 'snap', 'thunderbird', 'common', 'thunderbird.tmp', 'thunderbird-mcp', 'connection.json'));
 
